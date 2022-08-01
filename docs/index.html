@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Multi-Source MySQL Replication Demo</title>
+    <style>
+        .mono  {
+            font-family: monospace
+        }
+        .note  {
+            background-color: #E0E0E0;
+            padding: 3px
+        }
+    </style>
+</head>
+<body style="font-family: sans-serif; color: #505050; font-size: 15px; padding: 2% 10%">
+<h1>Multi-Source MySQL Replication Demo</h1>
+<p style="font-style: italic">Written by Matt Rosenberger.  Originally published on August 1st, 2022.</p>
+<p>
+    The purpose of this documentation is to demonstrate how easy Multi-Source Replication in MySQL is to setup.  This is
+    using Source -> Replica (aka dated Master -> Slave).  Master-Master or MultiMaster Replication is not covered here.
+    Please see <a href="https://dev.mysql.com/doc/refman/8.0/en/group-replication.html">Group Replication</a> for more
+    information.
+</p>
+<h2>Problem</h2>
+<p>
+    Nightly backups are a minimum requirement to running a business, but it may not be enough.  If a server goes down
+    towards the end of the day, restoring from yesterday's backup means a customer's entire day's work is gone.
+</p>
+<h2>Solution</h2>
+<p>
+    Setting up a server dedicated to MySQL Replication is too simple of a procedure to not implement in production to avoid losing customer
+    data. If production database ever goes down, all that is necessary is to stop replication, bringing a new server up,
+    taking a backup from the replica server, and restoring that backup on the new server.
+</p>
+<h2>Additional Benefits</h2>
+<p>
+    Hosting MySQL database changes isn't the only thing the replication server can do.  You can also move expensive
+    monitoring SQL queries or monitoring off of the production server and onto the replication server.
+</p>
+<h2>How It Works</h2>
+<p>
+    Replica server starts out with exact copy of Source databases. Replica connects to Source database servers.
+    Replica server is responsible for maintaining connection and will automatically reconnect.
+    User created on each Source database only needs to be granted <span class="mono">REPLICATION SLAVE</span> permission.
+    Changes made on the Source database server (UPDATE, DELETE, CREATE TABLE, ALTER TABLE, DROP TABLE, etc.) are sent to Replica as events.
+</p>
+<h2>GTID-based Replication</h2>
+<p>
+    GTID: Global transaction identifiers used to assign a timestamped id to every transaction.
+    MySQL documentation recommends using GTID-based replication to synchronize events.
+    Once GTID is enabled, backups created from a database that wasn't using GTID will not be able to restored.
+</p>
+<h2>Multi-Source</h2>
+<p>
+    All multi-source replication means is one replication server hosting replications from multiple production servers.
+    You do not have to do one production host to one replication server.  Since all we have to do is
+    add a couple of new configuration options (changing logging from <span class="mono">FILE</span> to <span class="mono">TABLE</span>) and add
+    <span class="mono">FOR CHANNEL 'channel_name'</span> to the end of all MySQL statements, why not start off with
+    a multi-source replication approach.
+</p>
+<h2>Demo</h2>
+<p>
+    I used VirtualBox for this demo.  I use 2 databases that use the same schema but with different data.
+    One database is for TV quotes and other database is for movie quotes.  Each database is hosted in its own VM.  These
+    are our source databases that simulate using production database servers.
+    The Replica VM will host both database copies.
+</p>
+<h3>VirtualBox Setup</h3>
+<p>
+    I created a pristine virtual machine (VM) with Ubuntu 22.04, OpenSSH installed, and installed MySQL
+    5.7 (nothing really changed between 5.7 and 8.0 for replication).  I then made 3 clones of the pristine VM.
+    Each copy was a Full Clone, Everything selected for Snapshots, and I generated new Mac addresses for all network
+    adapters.
+</p>
+<p>
+    I named the VMs SourceTV, SourceMovie, and Replica
+</p>
+<p class="note">
+    I used NAT Network so the VMs can communicate with each other on my laptop connected to the Internet via wifi.
+    I kept getting 2 IP addresses assigned by the built-in DHCP on each VM.  So what I did was run
+    <span class="mono">dhclient -r</span> then <span class="mono">dhclient</span>
+    a couple of times right when each VM was started.  I received a new IP address.  About 10 mins. later, a second
+    IP address was assigned.  It did not interfere with communication though.
+</p>
+<h3>Initial Setup</h3>
+<p>
+    We have to first setup the 2 source database servers. No replication configuration is done yet.
+    No MySQL configuration file changes have been made.  I'm using the default MySQL configurations.
+    I created a database
+    on each VM: one called tv and another called movie.  Next, I created the following schema for both databases:
+</p>
+<pre>
+    create table actor
+    (
+        id         varchar(64)  not null primary key,
+        first_name varchar(100) not null,
+        last_name  varchar(100) not null
+    );
+
+    create table quote
+    (
+        id          varchar(36) not null primary key,
+        actor_id    varchar(64) not null,
+        send_date   datetime    not null,
+        line        text        not null,
+        constraint actor___fk
+        foreign key (actor_id) references actor (id)
+    );
+</pre>
+<p>
+    I added the following for TV data:
+</p>
+<pre>
+    INSERT INTO actor (id, first_name, last_name) VALUES ('lucy', 'Lucille', 'Ball');
+    INSERT INTO quote (id, actor_id, send_date, line) VALUES ('5e58c6f9-0c4e-11ed-8d91-080027b72d1a', 'lucy',
+    '2022-08-01 00:00:01', 'Ethel and I have decided that you have married us and not a television set.');
+</pre>
+<p>
+    I added the following for Movie data:
+</p>
+<pre>
+    INSERT INTO actor (id, first_name, last_name) VALUES ('will', 'Will', 'Ferrell');
+    INSERT INTO quote (id, actor_id, send_date, line) VALUES ('4e58c6f9-0c4e-12ed-8d91-080027b62d1a', 'will',
+    '2022-08-01 00:17:05', 'You sit on a throne of lies.');
+</pre>
+<p>
+    I then did a mysqldump on each of the databases, started up the Replica VM, copied the mysqldump .sql files over
+    to Replica by using scp from inside the Replica VM, created both databases in the Replica VM, and applied the
+    .sql files using the SOURCE command from inside the MySQL client.
+</p>
+<h3>Replication Configuration</h3>
+<p>
+    These instructions apply to all 3 VMs:
+<ul>
+    <li><span class="mono">service mysql stop</span></li>
+    <li><span class="mono">rm /var/lib/mysql/auto.cnf</span></li>
+    <li>
+        Edit <span class="mono">/etc/mysql/mysql.conf.d/mysql.cnf</span>
+        <ul>
+            <li>Change bind-address value to assigned IP address (don't have to do this one for Replica)</li>
+            <li>Add the following:
+            <ul>
+                <li>server-id = &lt;Integer&gt; # Unique for each MySQL server</li>
+                <li>log-bin = mysql-bin</li>
+                <li>gtid-mode = ON</li>
+                <li>enforce-gtid-consistency = ON</li>
+            </ul>
+            </li>
+        </ul>
+    </li>
+</ul>
+</p>
+<p>
+    These instructions apply only to the Replica VM:
+<ul>
+    <li>Add additional configuration to <span class="mono">/etc/mysql/mysql.conf.d/mysql.cnf</span>
+        <ul>
+            <li>relay-log = relay-log-server</li>
+            <li>read-only = ON</li>
+            <li>log-slave-updates = ON</li>
+            <li>master-info-repository = TABLE</li>
+            <li>relay-log-info-repository = TABLE</li>
+        </ul>
+    </li>
+</ul>
+</p>
+<p>Run <span class="mono">service mysql start</span> on all 3 VMs</p>
+<h3>Create Replication User Account</h3>
+<p>
+    These instructions apply to the 2 source VMs:
+<ul>
+    <li>Launch the mysql client</li>
+    <li>
+        Create user account that the Replica will use for replication on each of the source servers:
+        <ul>
+            <li>TV
+                <ul>
+                    <li>CREATE USER 'tv'@'%' IDENTIFIED BY 'tv';</li>
+                    <li>GRANT REPLICATION SLAVE ON *.* TO 'tv'@'%';</li>
+                    <li>FLUSH PRIVILEGES;</li>
+                </ul>
+            </li>
+            <li>
+                Movie
+                <ul>
+                    <li>CREATE USER 'movie'@'%' IDENTIFIED BY 'movie';</li>
+                    <li>GRANT REPLICATION SLAVE ON *.* TO 'movie'@'%';</li>
+                    <li>GRANT REPLICATION SLAVE ON *.* TO 'movie'@'%';</li>
+                    <li>FLUSH PRIVILEGES;</li>
+                </ul>
+            </li>
+        </ul>
+    </li>
+</ul>
+</p>
+<h3>Replication Statements</h3>
+<p>
+    These instructions apply only to the Replica VM:
+<p>Launch the mysql client</p>
+<p>Create connection information for the TV source database:</p>
+<pre>
+    CHANGE MASTER TO
+    MASTER_HOST = '&lt;Source TV IP Address&gt;',
+    MASTER_USER = 'tv',
+    MASTER_PASSWORD = 'tv',
+    MASTER_AUTO_POSITION = 1
+    FOR CHANNEL 'source_tv';
+</pre>
+<p>Create connection information for the Movie source database:</p>
+<pre>
+    CHANGE MASTER TO
+    MASTER_HOST = '&lt;Source Movie IP Address&gt;',
+    MASTER_USER = 'movie',
+    MASTER_PASSWORD = 'movie',
+    MASTER_AUTO_POSITION = 1
+    FOR CHANNEL 'source_movie';
+</pre>
+<p>Command to start replication for each source database server:</p>
+<pre>START SLAVE FOR CHANNEL 'source_tv';</pre>
+<pre>START SLAVE FOR CHANNEL 'source_movie';</pre>
+<p>To verify that the replica is running, run the following to verify that the status is waiting for updates:</p>
+<pre>SHOW SLAVE STATUS FOR CHANNEL 'source_tv';</pre>
+<pre>SHOW SLAVE STATUS FOR CHANNEL 'source_movie';</pre>
+
+<h3>Test Out Replication</h3>
+<p>
+    Start creating records on the source databases and then query the tables in the replication databases to verify that
+    replication works.
+</p>
+<p>Change over to the Source TV VM and run the following queries:</p>
+<pre>
+    INSERT INTO actor (id, first_name, last_name) VALUES ('carell', 'Steve', 'Carell');
+    INSERT INTO quote (id, actor_id, send_date, line) VALUES (UUID(), 'carell', NOW(),
+    'Sometimes I\'ll start a sentence and I don\'t even know where it\'s going. I just hope I find it along the way.');
+</pre>
+<p>Change over to the Source Movie VM and run the following queries:</p>
+<pre>
+    INSERT INTO actor (id, first_name, last_name) VALUES ('hanks', 'Tom', 'Hanks');
+    INSERT INTO quote (id, actor_id, send_date, line) VALUES (UUID(), 'hanks', NOW(),
+    'There\'s no crying in baseball!');
+</pre>
+<p>Change over to the Replica VM and run <span class="mono">SELECT * from quote;</span> to see that the new quotes were replicated successfully!</p>
+</body>
+</html>
